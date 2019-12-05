@@ -208,4 +208,209 @@ function useSWR(...args) {
     },
     [key]
   )
+
+  // mounted (client side rendering)
+  useIsomorphicLayoutEffect(() => {
+    if (!key) return undefined
+
+    // after `key` updates, we need to mark it as mounted
+    unmountedRef.current = false
+
+    // after the component is mounted (hydrated),
+    // we need to update the data from the cache
+    // and trigger a revalidation
+
+    const currentHookData = dataRef.current
+    const latestKeyedData = cacheGet(key) || config.initialData
+
+    // update the state if the key changed or cache updated
+    if (
+      keyRef.current !== key ||
+      !deepEqual(currentHookData, latestKeyedData)
+    ) {
+      dispatch({ data: latestKeyedData })
+      dataRef.current = latestKeyedData
+      keyRef.current = key
+    }
+
+    // revalidate with deduping
+    const softRevalidate = () => revalidate({ dedupe: true })
+
+    // trigger a revalidation
+    if (
+      typeof latestKeyedData !== 'undefined' &&
+      !IS_SERVER &&
+      window['requestIdleCallback']
+    ) {
+      // delay revalidate if there's cache
+      // to not block the rendering
+      window['requestIdleCallback'](softRevalidate)
+    } else {
+      softRevalidate()
+    }
+
+    // whenever the window gets focused, revalidate
+    let onFocus
+    if (config.revalidateOnFocus) {
+      // throttle: avoid being called twice from both listeners
+      // and tabs being switched quickly
+      onFocus = throttle(softRevalidate, config.focusThrottleInterval)
+      if (!FOCUS_REVALIDATORS[key]) {
+        FOCUS_REVALIDATORS[key] = [onFocus]
+      } else {
+        FOCUS_REVALIDATORS[key].push(onFocus)
+      }
+    }
+
+    // register global cache update listener
+    const onUpdate = (
+      shouldRevalidate = true,
+      updatedData,
+      updatedError
+    ) => {
+      // update hook state
+      const newState = {}
+
+      if (
+        typeof updatedData !== 'undefined' &&
+        !deepEqual(dataRef.current, updatedData)
+      ) {
+        newState.data = updatedData
+        dataRef.current = updatedData
+      }
+
+      // always update error
+      // because it can be `undefined`
+      if (errorRef.current !== updatedError) {
+        newState.error = updatedError
+        errorRef.current = updatedError
+      }
+
+      dispatch(newState)
+
+      keyRef.current = key
+      if (shouldRevalidate) {
+        return softRevalidate()
+      }
+      return false
+    }
+
+    // add updater to listeners
+    if (!CACHE_REVALIDATORS[key]) {
+      CACHE_REVALIDATORS[key] = [onUpdate]
+    } else {
+      CACHE_REVALIDATORS[key].push(onUpdate)
+    }
+
+    // set up polling
+    let timeout = null
+    if (config.refreshInterval) {
+      const tick = async () => {
+        if (
+          !errorRef.current &&
+          (config.refreshWhenHidden || isDocumentVisible())
+        ) {
+          // only revalidate when the page is visible
+          // if API request errored, we stop polling in this round
+          // and let the error retry function handle it
+          await softRevalidate()
+        }
+
+        const interval = config.refreshInterval
+        timeout = setTimeout(tick, interval)
+      }
+      timeout = setTimeout(tick, config.refreshInterval)
+    }
+
+    return () => {
+      // cleanup
+      dispatch = () => null
+
+      // mark it as unmounted
+      unmountedRef.current = true
+
+      if (onFocus && FOCUS_REVALIDATORS[key]) {
+        const revalidators = FOCUS_REVALIDATORS[key]
+        const index = revalidators.indexOf(onFocus)
+        if (index >= 0) {
+          // 10x faster than splice
+          // https://jsperf.com/array-remove-by-index
+          revalidators[index] = revalidators[revalidators.length - 1]
+          revalidators.pop()
+        }
+      }
+      if (CACHE_REVALIDATORS[key]) {
+        const revalidators = CACHE_REVALIDATORS[key]
+        const index = revalidators.indexOf(onUpdate)
+        if (index >= 0) {
+          revalidators[index] = revalidators[revalidators.length - 1]
+          revalidators.pop()
+        }
+      }
+
+      if (timeout !== null) {
+        clearTimeout(timeout)
+      }
+    }
+  }, [key, config.refreshInterval, revalidate])
+
+  // suspense
+  if (config.suspense) {
+    if (IS_SERVER)
+      throw new Error('Suspense on server side is not yet supported!')
+
+    // in suspense mode, we can't return empty state
+    // (it should be suspended)
+
+    // try to get data and error from cache
+    let latestData = cacheGet(key)
+    let latestError = cacheGet(keyErr)
+
+    if (
+      typeof latestData === 'undefined' &&
+      typeof latestError === 'undefined'
+    ) {
+      // need to start the request if it hasn't
+      if (!CONCURRENT_PROMISES[key]) {
+        // trigger revalidate immediately
+        // to get the promise
+        revalidate()
+      }
+
+      if (
+        CONCURRENT_PROMISES[key] &&
+        typeof CONCURRENT_PROMISES[key].then === 'function'
+      ) {
+        // if it is a promise
+        throw CONCURRENT_PROMISES[key]
+      }
+
+      // it's a value, return it directly (override)
+      latestData = CONCURRENT_PROMISES[key]
+    }
+
+    if (typeof latestData === 'undefined' && latestError) {
+      // in suspense mode, throw error if there's no content
+      throw latestError
+    }
+
+    // return the latest data / error from cache
+    // in case `key` has changed
+    return {
+      error: latestError,
+      data: latestData,
+      revalidate,
+      isValidating: state.isValidating
+    }
+  }
+
+  return {
+    error: state.error,
+    // `key` might be changed in the upcoming hook re-render,
+    // but the previous state will stay
+    // so we need to match the latest key and data
+    data: keyRef.current === key ? state.data : undefined,
+    revalidate, // handler
+    isValidating: state.isValidating
+  }
 }
